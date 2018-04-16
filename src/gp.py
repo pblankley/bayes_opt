@@ -1,4 +1,6 @@
 import numpy as np
+from scipy.stats import norm
+import sampling
 import scipy.linalg as spla
 
 class GP(object):
@@ -63,9 +65,9 @@ class GP(object):
         x_diff = self.obsy - np.mean(self.obsx)
         
         # Get covariance matrix sections
-        cov = self.cov(self.obsx,self.obsx,self.thetas)+np.eye(dim1)*1e-7+ np.eye(dim1)*self.noise
-        cov_star = self.cov(self.obsx,xp,self.thetas)+np.eye(dim1,dim2)*1e-7+ np.eye(dim1,dim2)*self.noise
-        cov_ss = self.cov(xp,xp,self.thetas)+np.eye(dim2)*1e-7+ np.eye(dim2)*self.noise
+        cov = self.cov(self.obsx,self.obsx,self.thetas) + np.eye(dim1)*1e-10 + np.eye(dim1)*self.noise
+        cov_star = self.cov(self.obsx,xp,self.thetas) + np.eye(dim1,dim2)*1e-10 + np.eye(dim1,dim2)*self.noise
+        cov_ss = self.cov(xp,xp,self.thetas) + np.eye(dim2)*1e-10 + np.eye(dim2)*self.noise
         
         # Get useful cholsesky decompositions
         L = np.linalg.cholesky(cov)
@@ -73,7 +75,7 @@ class GP(object):
         
         # Calculate the posterior means and covariance matrix
         self.means = Linv_cov_s.T @ np.linalg.solve(L, self.obsy.reshape(-1,1))
-        self.cmat = cov_ss - Linv_cov_s.T @ Linv_cov_s +np.eye(dim2)*1e-7
+        self.cmat = cov_ss - Linv_cov_s.T @ Linv_cov_s #+np.eye(dim2)*1e-7
         self.std = np.sqrt(np.diag(cov_ss) - np.sum(Linv_cov_s**2, axis=0))
         
         return self.means.ravel(), self.std 
@@ -116,6 +118,26 @@ class GP(object):
         #return solve
         lp = np.sum(-0.5*y.T@solve)- np.log(np.diag(chol)).sum()- cov.shape[0] / 2*np.log(2*np.pi)
         return lp
+
+    def pi_metric(self,xp):
+        """ Probability of improvement metric """
+        best = np.min(self.obsy)
+        means, stds = self.draw_posterior(xp)
+        gamma = (best - means)/stds
+        return norm.cdf(gamma)
+
+    def ei_metric(self,xp):
+        """ Expected improvement metric """
+        best = np.min(self.obsy)
+        means, stds = self.draw_posterior(xp)
+        gamma = (best - means)/stds
+        return stds * (gamma*norm.cdf(gamma) + norm.pdf(gamma))
+    
+    def ucb_metric(self,xp,k):
+        """ GP Upper Confidence Bound metric """
+        means, stds = self.draw_posterior(xp)
+        return means - k*stds
+
 
 ########################## KERNELS ###############################
 def pdist2(x,xp,theta):
