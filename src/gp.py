@@ -1,11 +1,14 @@
 import numpy as np
+from scipy.stats import norm
 import scipy.linalg as spla
+from tqdm import tqdm
+import sampling 
 
 class GP(object):
     """ Gaussian process object """
-    def __init__(self, x, y, kernel, noise=0.0):
+    def __init__(self, x, y, kernel, noise=1e-3):
         self.obsx = np.array(x)
-        self.obsy = np.array(y)
+        self.obsy = np.array(y).reshape(-1,1)
         self.mean = np.mean(y)
         self.amp = np.std(y)
         self.kernel = kernel
@@ -63,9 +66,9 @@ class GP(object):
         x_diff = self.obsy - np.mean(self.obsx)
         
         # Get covariance matrix sections
-        cov = self.cov(self.obsx,self.obsx,self.thetas)+np.eye(dim1)*1e-7+ np.eye(dim1)*self.noise
-        cov_star = self.cov(self.obsx,xp,self.thetas)+np.eye(dim1,dim2)*1e-7+ np.eye(dim1,dim2)*self.noise
-        cov_ss = self.cov(xp,xp,self.thetas)+np.eye(dim2)*1e-7+ np.eye(dim2)*self.noise
+        cov = self.cov(self.obsx,self.obsx,self.thetas) + np.eye(dim1)*1e-10 + np.eye(dim1)*self.noise
+        cov_star = self.cov(self.obsx,xp,self.thetas) + np.eye(dim1,dim2)*1e-10 + np.eye(dim1,dim2)*self.noise
+        cov_ss = self.cov(xp,xp,self.thetas) + np.eye(dim2)*1e-10 + np.eye(dim2)*self.noise
         
         # Get useful cholsesky decompositions
         L = np.linalg.cholesky(cov)
@@ -73,7 +76,7 @@ class GP(object):
         
         # Calculate the posterior means and covariance matrix
         self.means = Linv_cov_s.T @ np.linalg.solve(L, self.obsy.reshape(-1,1))
-        self.cmat = cov_ss - Linv_cov_s.T @ Linv_cov_s +np.eye(dim2)*1e-7
+        self.cmat = cov_ss - Linv_cov_s.T @ Linv_cov_s + np.eye(dim2)*1e-10
         self.std = np.sqrt(np.diag(cov_ss) - np.sum(Linv_cov_s**2, axis=0))
         
         return self.means.ravel(), self.std 
@@ -114,10 +117,102 @@ class GP(object):
         solve = spla.cho_solve((chol, True), y-mean)
         #solve = np.linalg.solve(chol, y-mean)
         #return solve
-        lp = np.sum(-0.5*y.T@solve)- np.log(np.diag(chol)).sum()- cov.shape[0] / 2*np.log(2*np.pi)
+        lp = np.sum(-0.5*(y-mean).T@solve)- np.log(np.diag(chol)).sum()- cov.shape[0] / 2*np.log(2*np.pi)
         return lp
 
+    def pi_metric(self,xp):
+        """ Probability of improvement metric """
+        best = np.min(self.obsy)
+        means, stds = self.draw_posterior(xp)
+        gamma = (best - means)/(stds+1e-10)
+        return norm.cdf(gamma)
+
+    def ei_metric(self,xp):
+        """ Expected improvement metric """
+        best = np.min(self.obsy)
+        means, stds = self.draw_posterior(xp)
+        gamma = (best - means)/(stds+1e-10)
+        return stds * (gamma*norm.cdf(gamma) + norm.pdf(gamma))
+    
+    def ucb_metric(self,xp,k):
+        """ GP Upper Confidence Bound metric """
+        means, stds = self.draw_posterior(xp)
+        return -means + k*stds
+
+    def next_gp_hyper(self):
+        x,y = self.obsx, self.obsy
+
+        def lp_params(params):
+            amp, mean, noise = params
+
+            if mean > np.max(y) or mean < np.min(y):
+                return -np.inf
+
+            if amp < 0 or noise < 0:
+                return -np.inf
+            #print(x)
+            #print(amp)
+            #print(self.cov(x, x, self.thetas))
+            cov   = amp * (self.cov(x, x, self.thetas) + 1e-6*np.eye(x.shape[0])) + noise*np.eye(x.shape[0])
+            #print(cov)
+            #print(1e-6*np.eye(x.shape[0]))
+            chol  = np.linalg.cholesky(cov)
+            #print(chol.shape, (y-mean).shape)
+            solve = spla.cho_solve((chol, True), y-mean)
+            #lp = np.sum(-0.5*(y-mean).T@solve)- np.log(np.diag(chol)).sum()- cov.shape[0] / 2*np.log(2*np.pi)
+            lp    = -np.sum(np.log(np.diag(chol)))-0.5*np.dot((y-self.mean).T, solve)
+            return lp
+        new_params = sampling.slice(lp_params, np.array([self.amp,self.mean,self.noise]))
+        self.amp, self.mean, self.noise = new_params
+        self.noise = 1e-3
+
+        def lp_thetas(thetas):
+            if np.any(thetas < 0) or np.any(thetas > 2.0):
+                return -np.inf
+            cov   = self.amp * (self.cov(x, x, thetas) + 1e-6*np.eye(x.shape[0])) + self.noise*np.eye(x.shape[0])
+            chol  = np.linalg.cholesky(cov)
+            solve = spla.cho_solve((chol, True), y-self.mean)
+            #lp = np.sum(-0.5*(y-self.mean).T@solve)- np.log(np.diag(chol)).sum()- cov.shape[0] / 2*np.log(2*np.pi)
+            
+            lp    = -np.sum(np.log(np.diag(chol)))-0.5*np.dot((y-self.mean).T, solve)
+            return lp
+        new_thetas = sampling.slice(lp_thetas,self.thetas)
+        self.thetas = new_thetas
+
+    def next_proposal(self,xp,metric='ei',mcmc_itr=10):
+        metric_values = np.zeros((xp.shape[0], mcmc_itr))
+        if metric not in {'ei','pi','ucb','lcb'}:
+            raise ValueError(f'Metric type not implemented {metric}')
+
+        for itr in range(mcmc_itr):
+            self.next_gp_hyper()
+            if metric=='ei':
+                metric_values[:,itr] = self.ei_metric(xp)
+            if metric=='pi':
+                metric_values[:,itr] = self.pi_metric(xp)
+            if metric=='ucb' or metric=='lcb':
+                metric_values[:,itr] = self.ucb_metric(xp)
+
+        best_cand = np.argmax(metric_values.mean(axis=1))
+        return best_cand
+
+    def find_best(self,func,xp,iters,metric='ei',mcmc_itr=10):
+        history = []
+        for i in tqdm(range(iters)):
+            #print('iter',i)
+            next_prop = self.next_proposal(xp, metric, mcmc_itr)
+            next_val = xp[next_prop].reshape(-1,xp.shape[1])
+            prop_res = func(next_val).reshape(-1,1)
+            #print(self.obsx.shape, next_val.shape)
+            #print(self.obsy.shape, prop_res.shape)
+            self.obsx = np.append(self.obsx, next_val, axis=0)
+            self.obsy = np.append(self.obsy, prop_res, axis=0)
+            history.append((next_val,prop_res))
+        return min(history,key=lambda x: x[1]), history
+
+
 ########################## KERNELS ###############################
+
 def pdist2(x,xp,theta):
     # Idea from Jasper's code for efficiency.  The naive calculation takes a lot longer
     xm = x/theta
